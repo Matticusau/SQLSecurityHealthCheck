@@ -201,8 +201,125 @@ RAISERROR (N'Starting Pre-requisites check', 10, 1) WITH NOWAIT
 		--RETURN
 	END;
 
-	-- TO DO
-	-- Check additional least priviliges that could be used and add checks. Like the bpcheck does.
+-- TO DO: review these least priviliges and remove what we dont need
+
+	-- Check additional least priviliges that could be used and add checks. This is based on the logic in the https://github.com/Microsoft/tigertoolbox/blob/master/BPCheck/Check_BP_Servers.sql
+	IF (ISNULL(IS_SRVROLEMEMBER(N'sysadmin'), 0) = 0)
+	BEGIN
+		DECLARE @pid int, @pname sysname, @msdbpid int, @masterpid int
+		DECLARE @permstbl TABLE ([name] sysname);
+		DECLARE @permstbl_msdb TABLE ([id] tinyint IDENTITY(1,1), [perm] tinyint)
+	
+		SET @params = '@msdbpid_in int'
+
+		SELECT @pid = principal_id, @pname=name FROM master.sys.server_principals (NOLOCK) WHERE sid = SUSER_SID()
+
+		SELECT @masterpid = principal_id FROM master.sys.database_principals (NOLOCK) WHERE sid = SUSER_SID()
+
+		SELECT @msdbpid = principal_id FROM msdb.sys.database_principals (NOLOCK) WHERE sid = SUSER_SID()
+
+		-- Perms 1
+		IF (ISNULL(IS_SRVROLEMEMBER(N'serveradmin'), 0) <> 1) AND ((SELECT COUNT(l.name)
+			FROM master.sys.server_permissions p (NOLOCK) INNER JOIN master.sys.server_principals l (NOLOCK)
+			ON p.grantee_principal_id = l.principal_id
+				AND p.class = 100 -- Server
+				AND p.state IN ('G', 'W') -- Granted or Granted with Grant
+				AND l.is_disabled = 0
+				AND p.permission_name = 'ALTER SETTINGS'
+				AND QUOTENAME(l.name) = QUOTENAME(@pname)) = 0)
+		BEGIN
+			RAISERROR('[WARNING: If not sysadmin, then you must be a member of serveradmin server role or have the ALTER SETTINGS server permission. Exiting...]', 16, 1, N'serveradmin')
+			RETURN
+		END
+		ELSE IF (ISNULL(IS_SRVROLEMEMBER(N'serveradmin'), 0) <> 1) AND ((SELECT COUNT(l.name)
+			FROM master.sys.server_permissions p (NOLOCK) INNER JOIN sys.server_principals l (NOLOCK)
+			ON p.grantee_principal_id = l.principal_id
+				AND p.class = 100 -- Server
+				AND p.state IN ('G', 'W') -- Granted or Granted with Grant
+				AND l.is_disabled = 0
+				AND p.permission_name = 'VIEW SERVER STATE'
+				AND QUOTENAME(l.name) = QUOTENAME(@pname)) = 0)
+		BEGIN
+			RAISERROR('[WARNING: If not sysadmin, then you must be a member of serveradmin server role or granted the VIEW SERVER STATE permission. Exiting...]', 16, 1, N'serveradmin')
+			RETURN
+		END
+
+		-- Perms 2
+		INSERT INTO @permstbl
+		SELECT a.name
+		FROM master.sys.all_objects a (NOLOCK) INNER JOIN master.sys.database_permissions b (NOLOCK) ON a.[OBJECT_ID] = b.major_id
+		WHERE a.type IN ('P', 'X') AND b.grantee_principal_id <>0 
+		AND b.grantee_principal_id <>2
+		AND b.grantee_principal_id = @masterpid;
+
+		INSERT INTO @permstbl_msdb ([perm])
+		EXECUTE sp_executesql N'USE msdb; SELECT COUNT([name]) 
+	FROM msdb.sys.sysusers (NOLOCK) WHERE [uid] IN (SELECT [groupuid] 
+		FROM msdb.sys.sysmembers (NOLOCK) WHERE [memberuid] = @msdbpid_in) 
+	AND [name] = ''SQLAgentOperatorRole''', @params, @msdbpid_in = @msdbpid;
+
+		INSERT INTO @permstbl_msdb ([perm])
+		EXECUTE sp_executesql N'USE msdb; SELECT COUNT(dp.grantee_principal_id)
+	FROM msdb.sys.tables AS tbl (NOLOCK)
+	INNER JOIN msdb.sys.database_permissions AS dp (NOLOCK) ON dp.major_id=tbl.object_id AND dp.class=1
+	INNER JOIN msdb.sys.database_principals AS grantor_principal (NOLOCK) ON grantor_principal.principal_id = dp.grantor_principal_id
+	INNER JOIN msdb.sys.database_principals AS grantee_principal (NOLOCK) ON grantee_principal.principal_id = dp.grantee_principal_id
+	WHERE dp.state = ''G''
+		AND dp.grantee_principal_id = @msdbpid_in
+		AND dp.type = ''SL''', @params, @msdbpid_in = @msdbpid;
+
+		IF (SELECT [perm] FROM @permstbl_msdb WHERE [id] = 1) = 0 AND (SELECT [perm] FROM @permstbl_msdb WHERE [id] = 2) = 0
+		BEGIN
+			RAISERROR('[WARNING: If not sysadmin, then you must be a member of MSDB SQLAgentOperatorRole role, or have SELECT permission on the sysalerts table in MSDB to run full scope of checks]', 16, 1, N'msdbperms')
+			--RETURN
+		END
+		ELSE IF (ISNULL(IS_SRVROLEMEMBER(N'securityadmin'), 0) <> 1) AND ((SELECT COUNT([name]) FROM @permstbl WHERE [name] = 'xp_enumerrorlogs') = 0 OR (SELECT COUNT([name]) FROM @permstbl WHERE [name] = 'sp_readerrorlog') = 0 OR (SELECT COUNT([name]) FROM @permstbl WHERE [name] = 'xp_readerrorlog') = 0)
+		BEGIN
+			RAISERROR('[WARNING: If not sysadmin, then you must be a member of the securityadmin server role, or have EXECUTE permission on the following extended sprocs to run full scope of checks: xp_enumerrorlogs, xp_readerrorlog, sp_readerrorlog]', 16, 1, N'secperms')
+			--RETURN
+		END
+		ELSE IF (SELECT COUNT([name]) FROM @permstbl WHERE [name] = 'xp_cmdshell') = 0 OR (SELECT COUNT(credential_id) FROM master.sys.credentials WHERE name = '##xp_cmdshell_proxy_account##') = 0
+		BEGIN
+			RAISERROR('[WARNING: If not sysadmin, then you must be granted EXECUTE permissions on xp_cmdshell and a xp_cmdshell proxy account should exist to run full scope of checks]', 16, 1, N'xp_cmdshellproxy')
+			--RETURN
+		END
+		ELSE IF (SELECT COUNT([name]) FROM @permstbl WHERE [name] = 'xp_fileexist') = 0 OR
+			(SELECT COUNT([name]) FROM @permstbl WHERE [name] = 'sp_OAGetErrorInfo') = 0 OR
+			(SELECT COUNT([name]) FROM @permstbl WHERE [name] = 'sp_OACreate') = 0 OR
+			(SELECT COUNT([name]) FROM @permstbl WHERE [name] = 'sp_OADestroy') = 0 OR
+			(SELECT COUNT([name]) FROM @permstbl WHERE [name] = 'xp_regenumvalues') = 0 OR
+			(SELECT COUNT([name]) FROM @permstbl WHERE [name] = 'xp_regread') = 0 OR 
+			(SELECT COUNT([name]) FROM @permstbl WHERE [name] = 'xp_instance_regread') = 0 OR
+			(SELECT COUNT([name]) FROM @permstbl WHERE [name] = 'xp_servicecontrol') = 0 
+		BEGIN
+			RAISERROR('[WARNING: Must be a granted EXECUTE permissions on the following extended sprocs to run full scope of checks: sp_OACreate, sp_OADestroy, sp_OAGetErrorInfo, xp_fileexist, xp_regread, xp_instance_regread, xp_servicecontrol and xp_regenumvalues]', 16, 1, N'extended_sprocs')
+			--RETURN
+		END
+		ELSE IF (SELECT COUNT([name]) FROM @permstbl WHERE [name] = 'xp_msver') = 0 AND @sqlmajorver < 11
+		BEGIN
+			RAISERROR('[WARNING: Must be granted EXECUTE permissions on xp_msver to run full scope of checks]', 16, 1, N'extended_sprocs')
+			--RETURN
+		END
+	END;
+
+	-- Declare Global Variables
+	DECLARE @UpTime VARCHAR(12),@StartDate DATETIME
+	DECLARE @agt smallint, @ole smallint, @sao smallint, @xcmd smallint
+	DECLARE @ErrorSeverity int, @ErrorState int, @ErrorMessage NVARCHAR(4000)
+	DECLARE @CMD NVARCHAR(4000)
+	DECLARE @path NVARCHAR(2048)
+	DECLARE @sqlminorver int, @sqlbuild int, @clustered bit, @osver VARCHAR(5), @ostype VARCHAR(10), @osdistro VARCHAR(20), @server VARCHAR(128), @instancename NVARCHAR(128), @arch smallint, @ossp VARCHAR(25), @SystemManufacturer VARCHAR(128)
+	DECLARE @existout int, @FSO int, @FS int, @OLEResult int, @FileID int
+	DECLARE @FileName VARCHAR(200), @Text1 VARCHAR(2000), @CMD2 VARCHAR(100)
+	DECLARE @src VARCHAR(255), @desc VARCHAR(255), @psavail VARCHAR(20), @psver tinyint
+	DECLARE @dbid int, @dbname NVARCHAR(1000)
+
+	SELECT @instancename = CONVERT(VARCHAR(128),SERVERPROPERTY('InstanceName')) 
+	SELECT @server = RTRIM(CONVERT(VARCHAR(128), SERVERPROPERTY('MachineName')))
+	--SELECT @sqlmajorver = CONVERT(int, (@@microsoftversion / 0x1000000) & 0xff);
+	SELECT @sqlminorver = CONVERT(int, (@@microsoftversion / 0x10000) & 0xff);
+	SELECT @sqlbuild = CONVERT(int, @@microsoftversion & 0xffff);
+	SELECT @clustered = CONVERT(bit,ISNULL(SERVERPROPERTY('IsClustered'),0))
 
 	-- Test XPCmdShell and Powershell policy
 	IF @allow_xpcmdshell = 1
@@ -337,6 +454,74 @@ RAISERROR (N'Starting Pre-requisites check', 10, 1) WITH NOWAIT
 
 
 	--------------------------------------------------------------------------------------------------------------------------------
+	-- HA Information subsection
+	--------------------------------------------------------------------------------------------------------------------------------
+	RAISERROR (N'|-Starting HA Information', 10, 1) WITH NOWAIT
+	IF @clustered = 1
+	BEGIN
+		IF @sqlmajorver < 11
+			BEGIN
+				EXEC ('SELECT ''Information'' AS [Category], ''Cluster'' AS [Information], NodeName AS node_name FROM sys.dm_os_cluster_nodes (NOLOCK)')
+			END
+		ELSE
+			BEGIN
+				EXEC ('SELECT ''Information'' AS [Category], ''Cluster'' AS [Information], NodeName AS node_name, status_description, is_current_owner FROM sys.dm_os_cluster_nodes (NOLOCK)')
+			END
+		SELECT 'Information' AS [Category], 'Cluster' AS [Information], DriveName AS cluster_shared_drives FROM sys.dm_io_cluster_shared_drives (NOLOCK)
+	END
+	ELSE
+	BEGIN
+		SELECT 'Information' AS [Category], 'Cluster' AS [Information], 'NOT_CLUSTERED' AS [Status]
+	END;
+
+	IF @sqlmajorver > 10
+	BEGIN
+		DECLARE @IsHadrEnabled tinyint, @HadrManagerStatus tinyint
+		SELECT @IsHadrEnabled = CONVERT(tinyint, SERVERPROPERTY('IsHadrEnabled'))
+		SELECT @HadrManagerStatus = CONVERT(tinyint, SERVERPROPERTY('HadrManagerStatus'))
+	
+		SELECT 'Information' AS [Category], 'AlwaysOn_AG' AS [Information], 
+			CASE @IsHadrEnabled WHEN 0 THEN 'Disabled'
+				WHEN 1 THEN 'Enabled' END AS [AlwaysOn_Availability_Groups],
+			CASE WHEN @IsHadrEnabled = 1 THEN
+				CASE @HadrManagerStatus WHEN 0 THEN '[Not started, pending communication]'
+					WHEN 1 THEN '[Started and running]'
+					WHEN 2 THEN '[Not started and failed]'
+				END
+			END AS [Status];
+	
+		IF @IsHadrEnabled = 1
+		BEGIN	
+			IF EXISTS (SELECT 1 FROM sys.dm_hadr_cluster) 
+			SELECT 'Information' AS [Category], 'AlwaysOn_Cluster' AS [Information], cluster_name, quorum_type_desc, quorum_state_desc 
+			FROM sys.dm_hadr_cluster;
+
+			IF EXISTS (SELECT 1 FROM sys.dm_hadr_cluster_members) 
+			SELECT 'Information' AS [Category], 'AlwaysOn_Cluster_Members' AS [Information], member_name, member_type_desc, member_state_desc, number_of_quorum_votes 
+			FROM sys.dm_hadr_cluster_members;
+		
+			IF EXISTS (SELECT 1 FROM sys.dm_hadr_cluster_networks) 
+			SELECT 'Information' AS [Category], 'AlwaysOn_Cluster_Networks' AS [Information], member_name, network_subnet_ip, network_subnet_ipv4_mask, is_public, is_ipv4 
+			FROM sys.dm_hadr_cluster_networks;
+		END;
+	
+		IF @ptochecks = 1 AND @IsHadrEnabled = 1
+		BEGIN
+			-- Note: If low_water_mark_for_ghosts number is not increasing over time, it implies that ghost cleanup might not happen.
+			SET @sqlcmd = 'SELECT ''Information'' AS [Category], ''AlwaysOn_Replicas'' AS [Information], database_id, group_id, replica_id, group_database_id, is_local, synchronization_state_desc, 
+		is_commit_participant, synchronization_health_desc, database_state_desc, is_suspended, suspend_reason_desc, last_sent_time, last_received_time, last_hardened_time, 
+		last_redone_time, log_send_queue_size, log_send_rate, redo_queue_size, redo_rate, filestream_send_rate, last_commit_time, 
+		low_water_mark_for_ghosts' + CASE WHEN @sqlmajorver > 12 THEN ', secondary_lag_seconds' ELSE '' END + ' 
+	FROM sys.dm_hadr_database_replica_states'
+			EXECUTE sp_executesql @sqlcmd
+
+			SELECT 'Information' AS [Category], 'AlwaysOn_Replica_Cluster' AS [Information], replica_id, group_database_id, database_name, is_failover_ready, is_pending_secondary_suspend, 
+				is_database_joined, recovery_lsn, truncation_lsn 
+			FROM sys.dm_hadr_database_replica_cluster_states;
+		END
+	END;
+
+	--------------------------------------------------------------------------------------------------------------------------------
 	-- Linked servers info subsection
 	--------------------------------------------------------------------------------------------------------------------------------
 	RAISERROR (N'|-Starting Linked servers info', 10, 1) WITH NOWAIT
@@ -423,6 +608,341 @@ RAISERROR (N'Starting Pre-requisites check', 10, 1) WITH NOWAIT
 		END CATCH
 	END
 
+
+	--------------------------------------------------------------------------------------------------------------------------------
+	-- Logon triggers subsection
+	--------------------------------------------------------------------------------------------------------------------------------
+	RAISERROR (N'|-Starting Logon triggers', 10, 1) WITH NOWAIT
+	IF (SELECT COUNT([name]) FROM sys.server_triggers WHERE is_disabled = 0 AND is_ms_shipped = 0) > 0
+	BEGIN
+		SELECT 'Information' AS [Category], 'Logon_Triggers' AS [Information], name AS [Trigger_Name], type_desc AS [Trigger_Type],create_date, modify_date
+		FROM sys.server_triggers WHERE is_disabled = 0 AND is_ms_shipped = 0
+		ORDER BY name;
+	END
+	ELSE
+	BEGIN
+		SELECT 'Information' AS [Category], 'Logon_Triggers' AS [Information], '[NA]' AS [Comment]
+	END;
+	
+	--------------------------------------------------------------------------------------------------------------------------------
+	-- Database Information subsection
+	--------------------------------------------------------------------------------------------------------------------------------
+	RAISERROR (N'|-Starting Database Information', 10, 1) WITH NOWAIT
+	RAISERROR (N'  |-Building DB list', 10, 1) WITH NOWAIT
+	DECLARE @curdbname NVARCHAR(1000), @curdbid int, @currole tinyint, @cursecondary_role_allow_connections tinyint, @state tinyint
+	IF EXISTS (SELECT [object_id] FROM tempdb.sys.objects (NOLOCK) WHERE [object_id] = OBJECT_ID('tempdb.dbo.#tmpdbs0'))
+	DROP TABLE #tmpdbs0;
+	IF NOT EXISTS (SELECT [object_id] FROM tempdb.sys.objects (NOLOCK) WHERE [object_id] = OBJECT_ID('tempdb.dbo.#tmpdbs0'))
+	CREATE TABLE #tmpdbs0 (id int IDENTITY(1,1), [dbid] int, [dbname] NVARCHAR(1000), [compatibility_level] tinyint, is_read_only bit, [state] tinyint, is_distributor bit, [role] tinyint, [secondary_role_allow_connections] tinyint, is_database_joined bit, is_failover_ready bit, isdone bit);
+
+	IF EXISTS (SELECT [object_id] FROM tempdb.sys.objects (NOLOCK) WHERE [object_id] = OBJECT_ID('tempdb.dbo.#tmpdbfiledetail'))
+	DROP TABLE #tmpdbfiledetail;
+	IF NOT EXISTS (SELECT [object_id] FROM tempdb.sys.objects (NOLOCK) WHERE [object_id] = OBJECT_ID('tempdb.dbo.#tmpdbfiledetail'))
+	CREATE TABLE #tmpdbfiledetail([database_id] [int] NOT NULL, [file_id] int, [type_desc] NVARCHAR(60), [data_space_id] int, [name] sysname, [physical_name] NVARCHAR(260), [state_desc] NVARCHAR(60), [size] bigint, [max_size] bigint, [is_percent_growth] bit, [growth] int, [is_media_read_only] bit, [is_read_only] bit, [is_sparse] bit, [is_name_reserved] bit)
+
+	IF EXISTS (SELECT [object_id] FROM tempdb.sys.objects (NOLOCK) WHERE [object_id] = OBJECT_ID('tempdb.dbo.##tmpdbsizes'))
+	DROP TABLE ##tmpdbsizes;
+	IF NOT EXISTS (SELECT [object_id] FROM tempdb.sys.objects (NOLOCK) WHERE [object_id] = OBJECT_ID('tempdb.dbo.##tmpdbsizes'))
+	CREATE TABLE ##tmpdbsizes([database_id] [int] NOT NULL, [size] bigint, [type_desc] NVARCHAR(60))
+
+	IF @sqlmajorver < 11
+	BEGIN
+		SET @sqlcmd = 'SELECT database_id, name, [compatibility_level], is_read_only, [state], is_distributor, 1, 1, 0 FROM master.sys.databases (NOLOCK)'
+		INSERT INTO #tmpdbs0 ([dbid], [dbname], [compatibility_level], is_read_only, [state], is_distributor, [role], [secondary_role_allow_connections], [isdone])
+		EXEC sp_executesql @sqlcmd;
+	END;
+
+	IF @sqlmajorver > 10
+	BEGIN
+		SET @sqlcmd = 'SELECT sd.database_id, sd.name, sd.[compatibility_level], sd.is_read_only, sd.[state], sd.is_distributor, MIN(COALESCE(ars.[role],1)) AS [role], ar.secondary_role_allow_connections, rcs.is_database_joined, rcs.is_failover_ready, 0 
+		FROM master.sys.databases (NOLOCK) sd
+			LEFT JOIN sys.dm_hadr_database_replica_states (NOLOCK) d ON sd.database_id = d.database_id
+			LEFT JOIN sys.availability_replicas ar (NOLOCK) ON d.group_id = ar.group_id AND d.replica_id = ar.replica_id
+			LEFT JOIN sys.dm_hadr_availability_replica_states (NOLOCK) ars ON d.group_id = ars.group_id AND d.replica_id = ars.replica_id
+			LEFT JOIN sys.dm_hadr_database_replica_cluster_states (NOLOCK) rcs ON rcs.database_name = sd.name AND rcs.replica_id = ar.replica_id
+		GROUP BY sd.database_id, sd.name, sd.is_read_only, sd.[state], sd.is_distributor, ar.secondary_role_allow_connections, sd.[compatibility_level], rcs.is_database_joined, rcs.is_failover_ready;'
+		INSERT INTO #tmpdbs0 ([dbid], [dbname], [compatibility_level], is_read_only, [state], is_distributor, [role], [secondary_role_allow_connections], is_database_joined, is_failover_ready, [isdone])
+		EXEC sp_executesql @sqlcmd;
+	END;
+
+	/* Validate if database scope is set */
+	IF @dbScope IS NOT NULL AND ISNUMERIC(@dbScope) <> 1 AND @dbScope NOT LIKE '%,%'
+	BEGIN
+		RAISERROR('ERROR: Invalid parameter. Valid input consists of database IDs. If more than one ID is specified, the values must be comma separated.', 16, 42) WITH NOWAIT;
+		RETURN
+	END;
+	
+	RAISERROR (N'  |-Applying specific database scope list, if any', 10, 1) WITH NOWAIT
+	IF @dbScope IS NOT NULL
+	BEGIN
+		SELECT @sqlcmd = 'DELETE FROM #tmpdbs0 WHERE [dbid] > 4 AND [dbid] NOT IN (' + REPLACE(@dbScope,' ','') + ')'
+		EXEC sp_executesql @sqlcmd;
+	END;
+
+	/* Populate data file info*/
+	WHILE (SELECT COUNT(id) FROM #tmpdbs0 WHERE isdone = 0) > 0
+	BEGIN
+		SELECT TOP 1 @curdbname = [dbname], @curdbid = [dbid], @currole = [role], @state = [state], @cursecondary_role_allow_connections = secondary_role_allow_connections FROM #tmpdbs0 WHERE isdone = 0
+		IF (@currole = 2 AND @cursecondary_role_allow_connections = 0) OR @state <> 0
+		BEGIN
+			SET @sqlcmd = 'SELECT [database_id], [file_id], type_desc, data_space_id, name, physical_name, state_desc, size, max_size, is_percent_growth,growth, is_media_read_only, is_read_only, is_sparse, is_name_reserved
+	FROM sys.master_files (NOLOCK) WHERE [database_id] = ' + CONVERT(VARCHAR(10), @curdbid)
+		END
+		ELSE
+		BEGIN
+			SET @sqlcmd = 'USE ' + QUOTENAME(@curdbname) + ';
+	SELECT ' + CONVERT(VARCHAR(10), @curdbid) + ' AS [database_id], [file_id], type_desc, data_space_id, name, physical_name, state_desc, size, max_size, is_percent_growth,growth, is_media_read_only, is_read_only, is_sparse, is_name_reserved
+	FROM sys.database_files (NOLOCK)'
+		END
+
+		BEGIN TRY
+			INSERT INTO #tmpdbfiledetail
+			EXECUTE sp_executesql @sqlcmd
+		END TRY
+		BEGIN CATCH
+			SELECT ERROR_NUMBER() AS ErrorNumber, ERROR_MESSAGE() AS ErrorMessage;
+			SELECT @ErrorMessage = 'Database Information subsection - Error raised in TRY block. ' + ERROR_MESSAGE()
+			RAISERROR (@ErrorMessage, 16, 1);
+		END CATCH
+	
+		UPDATE #tmpdbs0
+		SET isdone = 1
+		WHERE [dbid] = @curdbid
+	END;
+
+	BEGIN TRY
+		INSERT INTO ##tmpdbsizes([database_id], [size], [type_desc])
+		SELECT [database_id], SUM([size]) AS [size], [type_desc]
+		FROM #tmpdbfiledetail
+		WHERE [type_desc] <> 'LOG'
+		GROUP BY [database_id], [type_desc]
+	END TRY
+	BEGIN CATCH
+		SELECT ERROR_NUMBER() AS ErrorNumber, ERROR_MESSAGE() AS ErrorMessage;
+		SELECT @ErrorMessage = 'Database Information subsection - Error raised in TRY block. ' + ERROR_MESSAGE()
+		RAISERROR (@ErrorMessage, 16, 1);
+	END CATCH
+
+	IF @sqlmajorver < 11
+	BEGIN
+		SET @sqlcmd = N'SELECT ''Information'' AS [Category], ''Databases'' AS [Information],
+		db.[name] AS [Database_Name], SUSER_SNAME(db.owner_sid) AS [Owner_Name], db.[database_id], 
+		db.recovery_model_desc AS [Recovery_Model], db.create_date, db.log_reuse_wait_desc AS [Log_Reuse_Wait_Description], 
+		(dbsize.[size]*8)/1024 AS [Data_Size_MB], ISNULL((dbfssize.[size]*8)/1024,0) AS [Filestream_Size_MB], 
+		ls.cntr_value/1024 AS [Log_Size_MB], lu.cntr_value/1024 AS [Log_Used_MB],
+		CAST(CAST(lu.cntr_value AS FLOAT) / CAST(ls.cntr_value AS FLOAT)AS DECIMAL(18,2)) * 100 AS [Log_Used_pct], 
+		db.[compatibility_level] AS [Compatibility_Level], db.collation_name AS [DB_Collation], 
+		db.page_verify_option_desc AS [Page_Verify_Option], db.is_auto_create_stats_on, db.is_auto_update_stats_on,
+		db.is_auto_update_stats_async_on, db.is_parameterization_forced, 
+		db.snapshot_isolation_state_desc, db.is_read_committed_snapshot_on,
+		db.is_read_only, db.is_auto_close_on, db.is_auto_shrink_on, ''NA'' AS [is_indirect_checkpoint_on], 
+		db.is_trustworthy_on, db.is_db_chaining_on, db.is_parameterization_forced
+	FROM master.sys.databases AS db (NOLOCK)
+	INNER JOIN ##tmpdbsizes AS dbsize (NOLOCK) ON db.database_id = dbsize.database_id
+	INNER JOIN sys.dm_os_performance_counters AS lu (NOLOCK) ON db.name = lu.instance_name
+	INNER JOIN sys.dm_os_performance_counters AS ls (NOLOCK) ON db.name = ls.instance_name
+	LEFT JOIN ##tmpdbsizes AS dbfssize (NOLOCK) ON db.database_id = dbfssize.database_id AND dbfssize.[type_desc] = ''FILESTREAM''
+	WHERE dbsize.[type_desc] = ''ROWS''
+		AND dbfssize.[type_desc] = ''FILESTREAM''
+		AND lu.counter_name LIKE N''Log File(s) Used Size (KB)%'' 
+		AND ls.counter_name LIKE N''Log File(s) Size (KB)%''
+		AND ls.cntr_value > 0 AND ls.cntr_value > 0' + CASE WHEN @dbScope IS NOT NULL THEN CHAR(10) + ' AND db.[database_id] IN (' + REPLACE(@dbScope,' ','') + ')' ELSE '' END + '
+	ORDER BY [Database_Name]	
+	OPTION (RECOMPILE)'
+	END
+	ELSE IF @sqlmajorver = 11
+	BEGIN
+		SET @sqlcmd = N'SELECT ''Information'' AS [Category], ''Databases'' AS [Information],
+		db.[name] AS [Database_Name], SUSER_SNAME(db.owner_sid) AS [Owner_Name], db.[database_id], 
+		db.recovery_model_desc AS [Recovery_Model], db.create_date, db.log_reuse_wait_desc AS [Log_Reuse_Wait_Description], 
+		(dbsize.[size]*8)/1024 AS [Data_Size_MB], ISNULL((dbfssize.[size]*8)/1024,0) AS [Filestream_Size_MB], 
+		ls.cntr_value/1024 AS [Log_Size_MB], lu.cntr_value/1024 AS [Log_Used_MB],
+		CAST(CAST(lu.cntr_value AS FLOAT) / CAST(ls.cntr_value AS FLOAT)AS DECIMAL(18,2)) * 100 AS [Log_Used_pct], 
+		db.[compatibility_level] AS [Compatibility_Level], db.collation_name AS [DB_Collation], 
+		db.page_verify_option_desc AS [Page_Verify_Option], db.is_auto_create_stats_on, db.is_auto_update_stats_on,
+		db.is_auto_update_stats_async_on, db.is_parameterization_forced, 
+		db.snapshot_isolation_state_desc, db.is_read_committed_snapshot_on,
+		db.is_read_only, db.is_auto_close_on, db.is_auto_shrink_on, 
+		CASE WHEN db.target_recovery_time_in_seconds > 0 THEN 1 ELSE 0 END AS is_indirect_checkpoint_on,
+		db.target_recovery_time_in_seconds, db.is_encrypted, db.is_trustworthy_on, db.is_db_chaining_on, db.is_parameterization_forced
+	FROM master.sys.databases AS db (NOLOCK)
+	INNER JOIN ##tmpdbsizes AS dbsize (NOLOCK) ON db.database_id = dbsize.database_id
+	INNER JOIN sys.dm_os_performance_counters AS lu (NOLOCK) ON db.name = lu.instance_name
+	INNER JOIN sys.dm_os_performance_counters AS ls (NOLOCK) ON db.name = ls.instance_name
+	LEFT JOIN ##tmpdbsizes AS dbfssize (NOLOCK) ON db.database_id = dbfssize.database_id AND dbfssize.[type_desc] = ''FILESTREAM''
+	WHERE dbsize.[type_desc] = ''ROWS''
+		AND lu.counter_name LIKE N''Log File(s) Used Size (KB)%'' 
+		AND ls.counter_name LIKE N''Log File(s) Size (KB)%''
+		AND ls.cntr_value > 0 AND ls.cntr_value > 0' + CASE WHEN @dbScope IS NOT NULL THEN CHAR(10) + ' AND db.[database_id] IN (' + REPLACE(@dbScope,' ','') + ')' ELSE '' END + '
+	ORDER BY [Database_Name]	
+	OPTION (RECOMPILE)'
+	END
+	ELSE IF @sqlmajorver = 12
+	BEGIN
+		SET @sqlcmd = N'SELECT ''Information'' AS [Category], ''Databases'' AS [Information],
+		db.[name] AS [Database_Name], SUSER_SNAME(db.owner_sid) AS [Owner_Name], db.[database_id], 
+		db.recovery_model_desc AS [Recovery_Model], db.create_date, db.log_reuse_wait_desc AS [Log_Reuse_Wait_Description], 
+		(dbsize.[size]*8)/1024 AS [Data_Size_MB], ISNULL((dbfssize.[size]*8)/1024,0) AS [Filestream_Size_MB], 
+		ls.cntr_value/1024 AS [Log_Size_MB], lu.cntr_value/1024 AS [Log_Used_MB],
+		CAST(CAST(lu.cntr_value AS FLOAT) / CAST(ls.cntr_value AS FLOAT)AS DECIMAL(18,2)) * 100 AS [Log_Used_pct], 
+		db.[compatibility_level] AS [Compatibility_Level], db.collation_name AS [DB_Collation], 
+		db.page_verify_option_desc AS [Page_Verify_Option], db.is_auto_create_stats_on, db.is_auto_create_stats_incremental_on,
+		db.is_auto_update_stats_on, db.is_auto_update_stats_async_on, db.delayed_durability_desc AS [delayed_durability_status], 
+		db.snapshot_isolation_state_desc, db.is_read_committed_snapshot_on,
+		db.is_read_only, db.is_auto_close_on, db.is_auto_shrink_on,
+		CASE WHEN db.target_recovery_time_in_seconds > 0 THEN 1 ELSE 0 END AS is_indirect_checkpoint_on,
+		db.target_recovery_time_in_seconds, db.is_encrypted, db.is_trustworthy_on, db.is_db_chaining_on, db.is_parameterization_forced
+	FROM master.sys.databases AS db (NOLOCK)
+	INNER JOIN ##tmpdbsizes AS dbsize (NOLOCK) ON db.database_id = dbsize.database_id
+	INNER JOIN sys.dm_os_performance_counters AS lu (NOLOCK) ON db.name = lu.instance_name
+	INNER JOIN sys.dm_os_performance_counters AS ls (NOLOCK) ON db.name = ls.instance_name
+	LEFT JOIN ##tmpdbsizes AS dbfssize (NOLOCK) ON db.database_id = dbfssize.database_id AND dbfssize.[type_desc] = ''FILESTREAM''
+	WHERE dbsize.[type_desc] = ''ROWS''
+		AND lu.counter_name LIKE N''Log File(s) Used Size (KB)%'' 
+		AND ls.counter_name LIKE N''Log File(s) Size (KB)%''
+		AND ls.cntr_value > 0 AND ls.cntr_value > 0' + CASE WHEN @dbScope IS NOT NULL THEN CHAR(10) + ' AND db.[database_id] IN (' + REPLACE(@dbScope,' ','') + ')' ELSE '' END + '
+	ORDER BY [Database_Name]	
+	OPTION (RECOMPILE)'
+	END
+	ELSE IF @sqlmajorver >= 13
+	BEGIN
+		SET @sqlcmd = N'SELECT ''Information'' AS [Category], ''Databases'' AS [Information],
+		db.[name] AS [Database_Name], SUSER_SNAME(db.owner_sid) AS [Owner_Name], db.[database_id], 
+		db.recovery_model_desc AS [Recovery_Model], db.create_date, db.log_reuse_wait_desc AS [Log_Reuse_Wait_Description], 
+		(dbsize.[size]*8)/1024 AS [Data_Size_MB], ISNULL((dbfssize.[size]*8)/1024,0) AS [Filestream_Size_MB], 
+		ls.cntr_value/1024 AS [Log_Size_MB], lu.cntr_value/1024 AS [Log_Used_MB],
+		CAST(CAST(lu.cntr_value AS FLOAT) / CAST(ls.cntr_value AS FLOAT)AS DECIMAL(18,2)) * 100 AS [Log_Used_pct], 
+		db.[compatibility_level] AS [Compatibility_Level], db.collation_name AS [DB_Collation], 
+		db.page_verify_option_desc AS [Page_Verify_Option], db.is_auto_create_stats_on, db.is_auto_create_stats_incremental_on,
+		db.is_auto_update_stats_on, db.is_auto_update_stats_async_on, db.delayed_durability_desc AS [delayed_durability_status], 
+		db.is_query_store_on, db.snapshot_isolation_state_desc, db.is_read_committed_snapshot_on,
+		db.is_read_only, db.is_auto_close_on, db.is_auto_shrink_on, 
+		CASE WHEN db.target_recovery_time_in_seconds > 0 THEN 1 ELSE 0 END AS is_indirect_checkpoint_on,
+		db.target_recovery_time_in_seconds, db.is_encrypted, db.is_trustworthy_on, db.is_db_chaining_on, db.is_parameterization_forced, 
+		db.is_memory_optimized_elevate_to_snapshot_on, db.is_remote_data_archive_enabled, db.is_mixed_page_allocation_on
+	FROM master.sys.databases AS db (NOLOCK)
+	INNER JOIN sys.dm_os_performance_counters AS lu (NOLOCK) ON db.name = lu.instance_name
+	INNER JOIN sys.dm_os_performance_counters AS ls (NOLOCK) ON db.name = ls.instance_name
+	INNER JOIN ##tmpdbsizes AS dbsize (NOLOCK) ON db.database_id = dbsize.database_id
+	LEFT JOIN ##tmpdbsizes AS dbfssize (NOLOCK) ON db.database_id = dbfssize.database_id AND dbfssize.[type_desc] = ''FILESTREAM''
+	WHERE dbsize.[type_desc] = ''ROWS''
+		AND lu.counter_name LIKE N''Log File(s) Used Size (KB)%'' 
+		AND ls.counter_name LIKE N''Log File(s) Size (KB)%''
+		AND ls.cntr_value > 0 AND ls.cntr_value > 0' + CASE WHEN @dbScope IS NOT NULL THEN CHAR(10) + ' AND db.[database_id] IN (' + REPLACE(@dbScope,' ','') + ')' ELSE '' END + '
+	ORDER BY [Database_Name]	
+	OPTION (RECOMPILE)'
+	END
+	ELSE IF @sqlmajorver = 14
+	BEGIN
+		SET @sqlcmd = N'SELECT ''Information'' AS [Category], ''Databases'' AS [Information],
+		db.[name] AS [Database_Name], SUSER_SNAME(db.owner_sid) AS [Owner_Name], db.[database_id], 
+		db.recovery_model_desc AS [Recovery_Model], db.create_date, db.log_reuse_wait_desc AS [Log_Reuse_Wait_Description], 
+		(dbsize.[size]*8)/1024 AS [Data_Size_MB], ISNULL((dbfssize.[size]*8)/1024,0) AS [Filestream_Size_MB], 
+		ls.cntr_value/1024 AS [Log_Size_MB], lu.cntr_value/1024 AS [Log_Used_MB],
+		CAST(CAST(lu.cntr_value AS FLOAT) / CAST(ls.cntr_value AS FLOAT)AS DECIMAL(18,2)) * 100 AS [Log_Used_pct],
+		CASE WHEN ssu.reserved_space_kb>0 THEN ssu.reserved_space_kb/1024 ELSE 0 END AS [Version_Store_Size_MB],
+		db.[compatibility_level] AS [Compatibility_Level], db.collation_name AS [DB_Collation], 
+		db.page_verify_option_desc AS [Page_Verify_Option], db.is_auto_create_stats_on, db.is_auto_create_stats_incremental_on,
+		db.is_auto_update_stats_on, db.is_auto_update_stats_async_on, db.delayed_durability_desc AS [delayed_durability_status], 
+		db.is_query_store_on, db.snapshot_isolation_state_desc, db.is_read_committed_snapshot_on,
+		db.is_read_only, db.is_auto_close_on, db.is_auto_shrink_on, 
+		CASE WHEN db.target_recovery_time_in_seconds > 0 THEN 1 ELSE 0 END AS is_indirect_checkpoint_on,
+		db.target_recovery_time_in_seconds, db.is_encrypted, db.is_trustworthy_on, db.is_db_chaining_on, db.is_parameterization_forced, 
+		db.is_memory_optimized_elevate_to_snapshot_on, db.is_remote_data_archive_enabled, db.is_mixed_page_allocation_on
+	FROM master.sys.databases AS db (NOLOCK)
+	INNER JOIN ##tmpdbsizes AS dbsize (NOLOCK) ON db.database_id = dbsize.database_id
+	INNER JOIN sys.dm_os_performance_counters AS lu (NOLOCK) ON db.name = lu.instance_name
+	INNER JOIN sys.dm_os_performance_counters AS ls (NOLOCK) ON db.name = ls.instance_name
+	LEFT JOIN ##tmpdbsizes AS dbfssize (NOLOCK) ON db.database_id = dbfssize.database_id AND dbfssize.[type_desc] = ''FILESTREAM''
+	LEFT JOIN sys.dm_tran_version_store_space_usage AS ssu (NOLOCK) ON db.database_id = ssu.database_id
+	WHERE dbsize.[type_desc] = ''ROWS''
+		AND lu.counter_name LIKE N''Log File(s) Used Size (KB)%'' 
+		AND ls.counter_name LIKE N''Log File(s) Size (KB)%''
+		AND ls.cntr_value > 0 AND ls.cntr_value > 0' + CASE WHEN @dbScope IS NOT NULL THEN CHAR(10) + ' AND db.[database_id] IN (' + REPLACE(@dbScope,' ','') + ')' ELSE '' END + '
+	ORDER BY [Database_Name]	
+	OPTION (RECOMPILE)'
+	END
+
+	EXECUTE sp_executesql @sqlcmd;
+	
+	SELECT 'Information' AS [Category], 'Database_Files' AS [Information], DB_NAME(database_id) AS [Database_Name], [file_id], type_desc, data_space_id AS [Filegroup], name, physical_name,
+		state_desc, (size * 8) / 1024 AS size_MB, CASE max_size WHEN -1 THEN 'Unlimited' ELSE CONVERT(VARCHAR(10), max_size) END AS max_size,
+		CASE WHEN is_percent_growth = 0 THEN CONVERT(VARCHAR(10),((growth * 8) / 1024)) ELSE growth END AS [growth], CASE WHEN is_percent_growth = 1 THEN 'Pct' ELSE 'MB' END AS growth_type,
+		is_media_read_only, is_read_only, is_sparse, is_name_reserved
+	FROM #tmpdbfiledetail
+	ORDER BY database_id, [file_id];
+
+	IF @sqlmajorver >= 12
+	BEGIN
+		/*DECLARE @dbid int, @dbname VARCHAR(1000), @sqlcmd NVARCHAR(4000)*/
+
+		IF EXISTS (SELECT [object_id] FROM tempdb.sys.objects (NOLOCK) WHERE [object_id] = OBJECT_ID('tempdb.dbo.#tblInMemDBs'))
+		DROP TABLE #tblInMemDBs;
+		IF NOT EXISTS (SELECT [object_id] FROM tempdb.sys.objects (NOLOCK) WHERE [object_id] = OBJECT_ID('tempdb.dbo.#tblInMemDBs'))
+		CREATE TABLE #tblInMemDBs ([DBName] sysname, [Has_MemoryOptimizedObjects] bit, [MemoryAllocated_MemoryOptimizedObjects_KB] DECIMAL(18,2), [MemoryUsed_MemoryOptimizedObjects_KB] DECIMAL(18,2));
+	
+		UPDATE #tmpdbs0
+		SET isdone = 0;
+
+		UPDATE #tmpdbs0
+		SET isdone = 1
+		WHERE [state] <> 0 OR [dbid] < 5;
+
+		UPDATE #tmpdbs0
+		SET isdone = 1
+		WHERE [role] = 2 AND secondary_role_allow_connections = 0;
+	
+		IF (SELECT COUNT(id) FROM #tmpdbs0 WHERE isdone = 0) > 0
+		BEGIN
+			RAISERROR (N'  |-Starting Storage analysis for In-Memory OLTP Engine', 10, 1) WITH NOWAIT
+	
+			WHILE (SELECT COUNT(id) FROM #tmpdbs0 WHERE isdone = 0) > 0
+			BEGIN
+				SELECT TOP 1 @dbname = [dbname], @dbid = [dbid] FROM #tmpdbs0 WHERE isdone = 0
+			
+				SET @sqlcmd = 'USE ' + QUOTENAME(@dbname) + ';
+	SELECT ''' + REPLACE(@dbname, CHAR(39), CHAR(95)) + ''' AS [DBName], ISNULL((SELECT 1 FROM sys.filegroups FG WHERE FG.[type] = ''FX''), 0) AS [Has_MemoryOptimizedObjects],
+	ISNULL((SELECT CONVERT(DECIMAL(18,2), (SUM(tms.memory_allocated_for_table_kb) + SUM(tms.memory_allocated_for_indexes_kb))) FROM sys.dm_db_xtp_table_memory_stats tms), 0.00) AS [MemoryAllocated_MemoryOptimizedObjects_KB],
+	ISNULL((SELECT CONVERT(DECIMAL(18,2),(SUM(tms.memory_used_by_table_kb) + SUM(tms.memory_used_by_indexes_kb))) FROM sys.dm_db_xtp_table_memory_stats tms), 0.00) AS [MemoryUsed_MemoryOptimizedObjects_KB];'
+
+				BEGIN TRY
+					INSERT INTO #tblInMemDBs
+					EXECUTE sp_executesql @sqlcmd
+				END TRY
+				BEGIN CATCH
+					SELECT ERROR_NUMBER() AS ErrorNumber, ERROR_MESSAGE() AS ErrorMessage;
+					SELECT @ErrorMessage = 'Storage analysis for In-Memory OLTP Engine subsection - Error raised in TRY block. ' + ERROR_MESSAGE()
+					RAISERROR (@ErrorMessage, 16, 1);
+				END CATCH
+			
+				UPDATE #tmpdbs0
+				SET isdone = 1
+				WHERE [dbid] = @dbid
+			END
+		END;
+
+		IF (SELECT COUNT([DBName]) FROM #tblInMemDBs WHERE [Has_MemoryOptimizedObjects] = 1) > 0
+		BEGIN
+			SELECT 'Information' AS [Category], 'InMem_Database_Storage' AS [Information], DBName AS [Database_Name],
+				[MemoryAllocated_MemoryOptimizedObjects_KB], [MemoryUsed_MemoryOptimizedObjects_KB]
+			FROM #tblInMemDBs WHERE Has_MemoryOptimizedObjects = 1
+			ORDER BY DBName;
+		END
+		ELSE
+		BEGIN
+			SELECT 'Information' AS [Category], 'InMem_Database_Storage' AS [Information], '[NA]' AS [Comment]
+		END
+	END;
+
+	-- http://support.microsoft.com/kb/2857849
+	IF @sqlmajorver > 10 AND @IsHadrEnabled = 1
+	BEGIN
+		SELECT 'Information' AS [Category], 'AlwaysOn_AG_Databases' AS [Information], dc.database_name AS [Database_Name],
+			d.synchronization_health_desc, d.synchronization_state_desc, d.database_state_desc
+		FROM sys.dm_hadr_database_replica_states d
+		INNER JOIN sys.availability_databases_cluster dc ON d.group_database_id=dc.group_database_id
+		WHERE d.is_local=1
+	END;
 
 	--------------------------------------------------------------------------------------------------------------------------------
 	-- Feature usage subsection
@@ -518,6 +1038,7 @@ RAISERROR (N'Starting Pre-requisites check', 10, 1) WITH NOWAIT
 		END
 	END;
 
+
 	--------------------------------------------------------------------------------------------------------------------------------
 	-- System Configuration subsection
 	--------------------------------------------------------------------------------------------------------------------------------
@@ -534,6 +1055,221 @@ RAISERROR (N'Starting Pre-requisites check', 10, 1) WITH NOWAIT
 		description AS [Description]
 	FROM sys.configurations (NOLOCK)
 	ORDER BY name OPTION (RECOMPILE);
+
+
+--------------------------------------------------------------------------------------------------------------------------------
+-- Pre-checks section
+--------------------------------------------------------------------------------------------------------------------------------
+	RAISERROR (N'Starting Pre-Checks - Building DB list excluding MS shipped', 10, 1) WITH NOWAIT
+	DECLARE @MSdb int
+
+	IF EXISTS (SELECT [object_id] FROM tempdb.sys.objects (NOLOCK) WHERE [object_id] = OBJECT_ID('tempdb.dbo.#tmpdbs1'))
+	DROP TABLE #tmpdbs1;
+	IF NOT EXISTS (SELECT [object_id] FROM tempdb.sys.objects (NOLOCK) WHERE [object_id] = OBJECT_ID('tempdb.dbo.#tmpdbs1'))
+	CREATE TABLE #tmpdbs1 (id int IDENTITY(1,1), [dbid] int, [dbname] NVARCHAR(1000), [role] tinyint, [secondary_role_allow_connections] tinyint, isdone bit)
+
+	RAISERROR (N'|-Excluding MS shipped by standard names and databases belonging to non-readable AG secondary replicas (if available)', 10, 1) WITH NOWAIT
+	-- Ignore MS shipped databases and databases belonging to non-readable AG secondary replicas
+	INSERT INTO #tmpdbs1 ([dbid], [dbname], [role], [secondary_role_allow_connections], [isdone])
+	SELECT [dbid], [dbname], [role], [secondary_role_allow_connections], 0 
+	FROM #tmpdbs0 (NOLOCK) 
+	WHERE is_read_only = 0 AND [state] = 0 AND [dbid] > 4 AND is_distributor = 0
+		AND [role] <> 2 AND (secondary_role_allow_connections <> 0 OR secondary_role_allow_connections IS NULL)
+		AND lower([dbname]) NOT IN ('virtualmanagerdb', --Virtual Machine Manager
+			'scspfdb', --Service Provider Foundation
+			'semanticsdb', --Semantic Search
+			'servicemanager','service manager','dwstagingandconfig','dwrepository','dwdatamart','dwasdatabase','omdwdatamart','cmdwdatamart', --SCSM
+			'ssodb','bamanalysis','bamarchive','bamalertsapplication','bamalertsnsmain','bamprimaryimport','bamstarschema','biztalkmgmtdb','biztalkmsgboxdb','biztalkdtadb','biztalkruleenginedb','bamprimaryimport','biztalkedidb','biztalkhwsdb','tpm','biztalkanalysisdb','bamprimaryimportsuccessfully', --BizTalk
+			'aspstate','aspnet', --ASP.NET
+			'mscrm_config', --Dynamics CRM
+			'cpsdyn','lcslog','lcscdr','lis','lyss','mgc','qoemetrics','rgsconfig','rgsdyn','rtc','rtcab','rtcab1','rtcdyn','rtcshared','rtcxds','xds', --Lync
+			'activitylog','branchdb','clienttracelog','eventlog','listingssettings','servicegroupdb','tservercontroller','vodbackend', --MediaRoom
+			'operationsmanager','operationsmanagerdw','operationsmanagerac', --SCOM
+			'orchestrator', --Orchestrator
+			'sso','wss_search','wss_search_config','sharedservices_db','sharedservices_search_db','wss_content','profiledb', 'social db','sync db',	--Sharepoint
+			'susdb', --WSUS
+			'projectserver_archive','projectserver_draft','projectserver_published','projectserver_reporting', --Project Server
+			'reportserver','reportservertempdb','rsdb','rstempdb', --SSRS
+			'fastsearchadmindatabase', --Fast Search
+			'ppsmonitoring','ppsplanningservice','ppsplanningsystem', --PerformancePoint Services
+			'dynamics', --Dynamics GP
+			'microsoftdynamicsax','microsoftdynamicsaxbaseline', --Dynamics AX
+			'fimservice','fimsynchronizationservice', --Forefront Identity Manager
+			'sbgatewaydatabase','sbmanagementdb', --Service Bus
+			'wfinstancemanagementdb','wfmanagementdb','wfresourcemanagementdb' --Workflow Manager
+		)
+		AND [dbname] NOT LIKE 'repANDtingservice[_]%' --SSRS
+		AND [dbname] NOT LIKE 'tfs[_]%' --TFS
+		AND [dbname] NOT LIKE 'defaultpowerpivotserviceapplicationdb%' --PowerPivot
+		AND [dbname] NOT LIKE 'perfANDmancepoint service[_]%' --PerfANDmancePoint Services
+		AND [dbname] NOT LIKE '%database nav%' --Dynamics NAV
+		AND [dbname] NOT LIKE '%[_]mscrm' --Dynamics CRM
+		AND [dbname] NOT LIKE 'dpmdb[_]%' --DPM
+		AND [dbname] NOT LIKE 'sbmessagecontainer%' --Service Bus
+		AND [dbname] NOT LIKE 'sma%' --SCSMA
+		AND [dbname] NOT LIKE 'releasemanagement%' --TFS Release Management
+		AND [dbname] NOT LIKE 'projectwebapp%' --Project Server
+		AND [dbname] NOT LIKE 'sms[_]%' AND [dbname] NOT LIKE 'cm[_]%' --SCCM
+		AND [dbname] NOT LIKE 'fepdw%' AND [dbname] NOT LIKE 'FEPDB[_]%' --Forefront Endpoint Protection
+		--Sharepoint
+		AND [dbname] NOT LIKE 'sharepoint[_]admincontent%' AND [dbname] NOT LIKE 'sharepoint[_]config%' AND [dbname] NOT LIKE 'wss[_]content%' AND [dbname] NOT LIKE 'wss[_]search%'
+		AND [dbname] NOT LIKE 'sharedservices[_]db%' AND [dbname] NOT LIKE 'sharedservices[_]search[_]db%' AND [dbname] NOT LIKE 'sharedservices[_][_]db%' AND [dbname] NOT LIKE 'sharedservices[_][_]search[_]db%'
+		AND [dbname] NOT LIKE 'sharedservicescontent%' AND [dbname] NOT LIKE 'application[_]registry[_]service[_]db%' AND [dbname] NOT LIKE 'search[_]service[_]application[_]propertystANDedb[_]%'
+		AND [dbname] NOT LIKE 'subscriptionsettings[_]%' AND [dbname] NOT LIKE 'webanalyticsserviceapplication[_]stagingdb[_]%' AND [dbname] NOT LIKE 'webanalyticsserviceapplication[_]repANDtingdb[_]%'
+		AND [dbname] NOT LIKE 'bdc[_]service[_]db[_]%' AND [dbname] NOT LIKE 'managed metadata service[_]%' AND [dbname] NOT LIKE 'perfANDmancepoint service application[_]%' 
+		AND [dbname] NOT LIKE 'search[_]service[_]application[_]crawlstANDedb[_]%' AND [dbname] NOT LIKE 'search[_]service[_]application[_]db[_]%' AND [dbname] NOT LIKE 'secure[_]stANDe[_]service[_]db[_]%' AND [dbname] NOT LIKE 'stateservice%' 
+		AND [dbname] NOT LIKE 'user profile service application[_]profiledb[_]%' AND [dbname] NOT LIKE 'user profile service application[_]syncdb[_]%' AND [dbname] NOT LIKE 'user profile service application[_]socialdb[_]%' 
+		AND [dbname] NOT LIKE 'wANDdautomationservices[_]%' AND [dbname] NOT LIKE 'wss[_]logging%' AND [dbname] NOT LIKE 'wss[_]usageapplication%' AND [dbname] NOT LIKE 'appmng[_]service[_]db%' 
+		AND [dbname] NOT LIKE 'search[_]service[_]application[_]analyticsrepANDtingstANDedb[_]%' AND [dbname] NOT LIKE 'search[_]service[_]application[_]linksstANDedb[_]%' AND [dbname] NOT LIKE 'sharepoint[_]logging[_]%' 
+		AND [dbname] NOT LIKE 'settingsservicedb%' AND [dbname] NOT LIKE 'sharepoint[_]logging[_]%' AND [dbname] NOT LIKE 'translationservice[_]%' AND [dbname] NOT LIKE 'sharepoint translation services[_]%' AND [dbname] NOT LIKE 'sessionstateservice%' 
+
+	IF EXISTS (SELECT name FROM msdb.sys.objects (NOLOCK) WHERE name='MSdistributiondbs' AND is_ms_shipped = 1) 
+	BEGIN 
+		DELETE FROM #tmpdbs1 WHERE [dbid] IN (SELECT DB_ID(name) FROM msdb.dbo.MSdistributiondbs)
+	END;
+
+	RAISERROR (N'|-Excluding MS shipped by notable object names', 10, 1) WITH NOWAIT
+	-- Removing other noticeable MS shipped DBs
+	WHILE (SELECT COUNT(id) FROM #tmpdbs1 WHERE isdone = 0) > 0
+	BEGIN
+		SELECT TOP 1 @dbname = [dbname], @dbid = [dbid] FROM #tmpdbs1 WHERE isdone = 0
+		SET @sqlcmd = 'USE ' + QUOTENAME(@dbname) + ';
+	IF (OBJECT_ID(''dbo.AR_Class'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.AR_Entity'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.AR_System'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.proc_ar_CreateEntity'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.proc_ar_CreateMethod'',''P'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.Versions'',''U'') IS NOT NULL 
+		AND (OBJECT_ID(''dbo.ECMApplicationLog'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.ECMTerm'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.proc_ECM_GetPackage'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.proc_ECM_GetGroups'',''P'') IS NOT NULL)
+		OR (OBJECT_ID(''dbo.Configuration'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.MonthlyPartitions'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.Search_GetCrawlPipeline'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.prc_EnumSandboxedRequests'',''P'') IS NOT NULL)
+		OR (OBJECT_ID(''dbo.MSSConfiguration'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.MSSOrdinal'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.proc_MSS_GetConfigurationProperty'',''P'') IS NOT NULL)
+		OR (OBJECT_ID(''dbo.Tenants'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.proc_Admin_ListPartitionedTables'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.proc_DefragmentIndices'',''P'') IS NOT NULL)
+		OR (OBJECT_ID(''dbo.WAScope'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.WASetting'',''U'') IS NOT NULL AND SCHEMA_ID(''Processing'') IS NOT NULL)
+		OR (OBJECT_ID(''dbo.Groups'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.Items'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.proc_GetGroups'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.proc_GetVersion'',''P'') IS NOT NULL)
+		OR (OBJECT_ID(''dbo.Mapping'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.PropertySet'',''U'') IS NOT NULL AND SCHEMA_ID(''SubscriptionSettingsService_Application_Pool'') IS NOT NULL) 
+		OR (OBJECT_ID(''dbo.Sessions'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.proc_AddItem'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.proc_GetItemWithLock'',''P'') IS NOT NULL)
+		OR (OBJECT_ID(''dbo.SiteMap'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.SiteCounts'',''U'') IS NOT NULL AND SCHEMA_ID(''WSS_Content_Application_Pools'') IS NOT NULL)
+		OR (OBJECT_ID(''dbo.PPSAnnotations'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.PPSParameterValues'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.proc_PPS_GetAnnotation'',''P'') IS NOT NULL)	 
+		OR (OBJECT_ID(''dbo.AM_Licenses'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.AM_DeploymentIds'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.proc_AM_GetApps'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.proc_AM_SetDeploymentId'',''P'') IS NOT NULL)	
+		OR (OBJECT_ID(''dbo.MSSDefinitions'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.MSSSecurityDescriptors'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.proc_MSS_GetCrawls'',''P'') IS NOT NULL)
+	)
+	OR (OBJECT_ID(''dbo.SSSApplication'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.SSSAudit'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.SSSConfig'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.proc_sss_GetConfig'',''P'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.Actions'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.VersionInfo'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.mms_extensions'',''U'') IS NOT NULL AND SCHEMA_ID(''persistenceUsers'') IS NOT NULL AND SCHEMA_ID(''state_persistence_users'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.AllDocs'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.AllLists'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.NameValuePair'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.proc_GetWorkItems'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.proc_EnumLists'',''P'') IS NOT NULL)	
+	OR (OBJECT_ID(''dbo.SSO_Application'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.SSO_Ticket'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.SSO_Config'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.sso_InsertAudit'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.sso_RetrieveSSOConfig'',''P'') IS NOT NULL)
+	-- End Sharepoint
+	OR ((OBJECT_ID(''dbo.ASPStateTempSessions'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.ASPStateTempApplications'',''U'') IS NOT NULL) OR OBJECT_ID(''dbo.CreateTempTables'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.DeleteExpiredSessions'',''P'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.aspnet_Applications'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.aspnet_Profile'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.aspnet_Users'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.aspnet_CheckSchemaVersion'',''P'') IS NOT NULL)
+	-- End ASP.NET
+	OR (OBJECT_ID(''DataRefresh.Runs'',''U'') IS NOT NULL AND OBJECT_ID(''GeminiService.Version'',''U'') IS NOT NULL AND OBJECT_ID(''Usage.Requests'',''U'') IS NOT NULL AND SCHEMA_ID(''HealthRule'') IS NOT NULL)
+	-- End PowerPivot
+	OR (OBJECT_ID(''dbo.LICENSES'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.VERSION'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.TASK_RUNPROGRAM'',''U'') IS NOT NULL AND SCHEMA_ID(''Microsoft.SystemCenter.Orchestrator'') IS NOT NULL)
+	-- End Orchestrator
+	OR (OBJECT_ID(''dbo.tbl_Cloud_Cloud'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.tbl_PXE_PxeServer'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.tbl_VMM_Server'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.prc_VMM_AddVmmServer'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.prc_Cloud_Cloud_GetParent'',''P'') IS NOT NULL)
+	-- End VMM
+	OR (OBJECT_ID(''scspf.EventHandlers'',''U'') IS NOT NULL AND OBJECT_ID(''scspf.Servers'',''U'') IS NOT NULL AND OBJECT_ID(''scspf.Tenants'',''U'') IS NOT NULL)
+	-- End Service Provider Foundation
+	OR ((OBJECT_ID(''dbo.SSOX_AuditTable'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.SSOX_GlobalInfo'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.SSOX_Servers'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.sp_BackupBizTalkFull'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.ssox_spGetDBVersion'',''P'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.BizTalkDBVersion'',''U'') IS NOT NULL AND SCHEMA_ID(''BTS_ADMIN_USERS'') IS NOT NULL AND SCHEMA_ID(''BTS_OPERATORS'') IS NOT NULL))
+	-- End BizTalk
+	OR (OBJECT_ID(''dbo.Layer'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.ModelGroup'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.SchemaVersion'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.XI_GetUserName'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.XU_AssignAxId'',''P'') IS NOT NULL)
+	-- End Dynamics AX
+	OR (OBJECT_ID(''dbo.Notification'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.SystemUserRoles'',''U'') IS NOT NULL 
+		AND (OBJECT_ID(''dbo.p_GetCrmUserId'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.p_GetPrivilegesInRole'',''P'') IS NOT NULL)
+		OR (OBJECT_ID(''dbo.p_AccountOVRollup'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.p_GetDbSize'',''P'') IS NOT NULL))
+	-- End Dynamics CRM
+	OR (OBJECT_ID(''dbo.User Personalization'',''U'') IS NOT NULL AND EXISTS(SELECT 1 FROM sys.all_objects (NOLOCK) WHERE type=''U'' AND (name like ''%$G[_]L Entry'' OR name LIKE ''%$Item Ledger Entry'')))
+	-- End Dynamics NAV
+	OR (OBJECT_ID(''dbo.DBVERSION'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.PATH'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.SY_SQL_Options'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.zDP_ActivitySD'',''P'') IS NOT NULL)
+	-- End Dynamics GP
+	OR (OBJECT_ID(''dbo.Agents'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.DistributionPoints'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.SysResList'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.PXE_GetPXECert'',''P'') IS NOT NULL)
+	-- End SCCM
+	OR (OBJECT_ID(''dbo.dtFEP_Infra_InstalledJobs'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.dtFEP_Common_User'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.dtAN_Infra_JobLastRun'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.spFEP_Infra_CreateJob'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.spAN_Infra_ScheduleJob'',''P'') IS NOT NULL)
+	-- End Forefront Endpoint Protection
+	OR (OBJECT_ID(''admin.categories'',''U'') IS NOT NULL AND OBJECT_ID(''admin.keyword'',''U'') IS NOT NULL AND OBJECT_ID(''admin.storeentry'',''U'') IS NOT NULL)
+	-- End Fast Search
+	OR (OBJECT_ID(''fim.Objects'',''U'') IS NOT NULL AND SCHEMA_ID(''debug'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.mms_extensions'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.mms_partition'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.mms_addmvlink'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.mms_getcsguidfromanchor'',''P'') IS NOT NULL)
+	-- End Forefront Identity Manager
+	OR (OBJECT_ID(''dbo.Annotations'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.BsmUsers'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.FCObjects'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.BsmUserCreate'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.BsmUserDelete'',''P'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.DBSchemaVersion'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.QueueStatus'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.ServerStates'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.bsp_UpdateQueueSizeLimit'',''P'') IS NOT NULL)
+	-- End PerformancePoint Services
+	OR (OBJECT_ID(''dbo.Versions'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.MSP_DAL_GetDatabaseCacheExceptions'',''P'') IS NOT NULL AND (OBJECT_ID(''dbo.MSP_DAL_GetSprocInfo'',''P'') IS NOT NULL OR OBJECT_ID(''dbo.MSP_DAL_GetSprocList'',''P'') IS NOT NULL))
+	-- End Project Server
+	OR (OBJECT_ID(''apm.MESSAGES'',''U'') IS NOT NULL AND SCHEMA_ID(''CS'') IS NOT NULL OR SCHEMA_ID(''CM'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.Event_00'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.MT_Database'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.PerformanceData_00'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.p_MPSelectViews'',''P'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.AemApplication'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.EventLoggingComputer'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.HealthState'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.p_MOMManagementGroupInfoSelect'',''P'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.dtMachine'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.dtPartition'',''U'') IS NOT NULL AND SCHEMA_ID(''AdtServer'') IS NOT NULL)
+	-- End SCOM
+	OR (OBJECT_ID(''dbo.version'',''U'') IS NOT NULL AND EXISTS(SELECT 1 FROM sys.internal_tables (NOLOCK) WHERE name LIKE ''language[_]model[_]%''))
+	-- End Semantic Search
+	OR (OBJECT_ID(''dbo.tbComputerTarget'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.tbTarget'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.tbUpdate'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.spGetUpdateByID'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.spSearchUpdates'',''P'') IS NOT NULL)
+	-- End WSUS
+	OR (OBJECT_ID(''dbo.tbl_DPM_InstalledUpdates'',''U'') IS NOT NULL AND SCHEMA_ID(''MSDPMExecRole'') IS NOT NULL AND SCHEMA_ID(''MSDPMRecoveryRole'') IS NOT NULL)
+	-- End DPM
+	OR ((OBJECT_ID(''dbo.DomainTable'',''U'') IS NOT NULL AND OBJECT_ID(''etl.Source'',''U'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.Module'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.MT_Computer'',''U'') IS NOT NULL AND OBJECT_ID(''LFXSTG.vex_Collection'',''U'') IS NOT NULL AND SCHEMA_ID(''LFX'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.DomainTable'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.State'',''U'') IS NOT NULL AND SCHEMA_ID(''etl'') IS NOT NULL))
+	-- End SCSM
+	OR (OBJECT_ID(''dbo.ChunkData'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.SegmentedChunk'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.SnapshotData'',''U'') IS NOT NULL AND SCHEMA_ID(''RSExecRole'') IS NOT NULL)
+	-- End SSRS
+	OR (OBJECT_ID(''dbo.prc_ChangeHostId'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.prc_EnablePrefixCompression'',''P'') IS NOT NULL 
+	AND (OBJECT_ID(''dbo.tbl_RegistryItems'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.tbl_OAuthToken'',''U'') IS NOT NULL AND	OBJECT_ID(''dbo.tbl_Content'',''U'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.DimBuild'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.FactCurrentWorkItem'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.FactBuildProject'',''U'') IS NOT NULL))
+	OR (OBJECT_ID(''dbo.LoadTestCase'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.LoadTestReport'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.LoadTestScenario'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.prc_GetAgents'',''P'') IS NOT NULL	AND OBJECT_ID(''dbo.prc_QueryLoadTestRuns'',''P'') IS NOT NULL)
+	-- End TFS
+	OR (OBJECT_ID(''dbo.Release'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.Server'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.TeamProject'',''U'') IS NOT NULL AND SCHEMA_ID(''System.Activities.DurableInstancing'') IS NOT NULL)
+	-- End TFS Release Management
+	OR (OBJECT_ID(''dbo.ContainersTable'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.Quotas'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.Tenants'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.GetAllEntities'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.UpdateGatewayEntity'',''P'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.LockResourcesTable'',''U'') IS NOT NULL AND OBJECT_ID(''Store.Nodes'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.OperationsTable'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.AcquireLock'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.UpdateOperation'',''P'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.CursorsTable'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.LogsTable'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.MessagesTable'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.GetCursorState'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.LockEntity'',''P'') IS NOT NULL)
+	-- End Service Bus
+	OR (OBJECT_ID(''dbo.DebugTraces'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.Instances'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.StoreVersionTable'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.GetInstanceCount'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.GetStoreVersion'',''P'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.StoreVersionTable'',''U'') IS NOT NULL AND OBJECT_ID(''Store.Clusters'',''U'') IS NOT NULL AND OBJECT_ID(''Store.Services'',''U'') IS NOT NULL AND OBJECT_ID(''Store.GetNode'',''P'') IS NOT NULL AND OBJECT_ID(''Store.UpdateCluster'',''P'') IS NOT NULL)
+	OR (OBJECT_ID(''dbo.Activities'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.Scopes'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.WorkflowServices'',''U'') IS NOT NULL AND OBJECT_ID(''dbo.GetActivities'',''P'') IS NOT NULL AND OBJECT_ID(''dbo.TenantCheck'',''P'') IS NOT NULL)
+	-- End Workflow Manager
+	OR (OBJECT_ID(''Core.Runbooks'',''U'') IS NOT NULL AND OBJECT_ID(''Core.Activities'',''U'') IS NOT NULL AND OBJECT_ID(''Core.Connections'',''U'') IS NOT NULL AND SCHEMA_ID(''Common'') IS NOT NULL)
+	-- End SCSMA
+	BEGIN
+		SELECT @MSdbOUT = ' + CONVERT(VARCHAR(10), @dbid) + '
+	END'
+		SET @params = N'@MSdbOUT int OUTPUT';
+		EXECUTE sp_executesql @sqlcmd, @params, @MSdbOUT=@MSdb OUTPUT
+	
+		IF @MSdb = @dbid
+		BEGIN
+			DELETE FROM #tmpdbs1 
+			WHERE [dbid] = @dbid;
+		END
+		ELSE
+		BEGIN
+			UPDATE #tmpdbs1
+			SET isdone = 1
+			WHERE [dbid] = @dbid
+		END
+	END;
+
+	UPDATE #tmpdbs1
+	SET isdone = 0;
+
+	RAISERROR (N'|-Applying 2nd layer of specific database scope, if any', 10, 1) WITH NOWAIT
+
+	IF EXISTS (SELECT [object_id] FROM tempdb.sys.objects (NOLOCK) WHERE [object_id] = OBJECT_ID('tempdb.dbo.#tmpdbs_userchoice'))
+	DROP TABLE #tmpdbs_userchoice;
+	IF NOT EXISTS (SELECT [object_id] FROM tempdb.sys.objects (NOLOCK) WHERE [object_id] = OBJECT_ID('tempdb.dbo.#tmpdbs_userchoice'))
+	CREATE TABLE #tmpdbs_userchoice ([dbid] int PRIMARY KEY, [dbname] NVARCHAR(1000))
+	
+	IF @dbScope IS NOT NULL
+	BEGIN
+		SELECT @sqlcmd = 'SELECT [dbid], [dbname] 
+	FROM #tmpdbs0 (NOLOCK) 
+	WHERE is_read_only = 0 AND [state] = 0 AND [dbid] > 4 AND is_distributor = 0
+		AND [role] <> 2 AND (secondary_role_allow_connections <> 0 OR secondary_role_allow_connections IS NULL)
+		AND [dbid] IN (' + REPLACE(@dbScope,' ','') + ')'
+	
+		INSERT INTO #tmpdbs_userchoice ([dbid], [dbname])
+		EXEC sp_executesql @sqlcmd;
+
+		SELECT @sqlcmd = 'DELETE FROM #tmpdbs1 WHERE [dbid] NOT IN (' + REPLACE(@dbScope,' ','') + ')'
+		EXEC sp_executesql @sqlcmd;
+	END;
+
 
 
 --------------------------------------------------------------------------------------------------------------------------------
